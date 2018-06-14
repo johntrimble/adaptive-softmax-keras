@@ -126,7 +126,12 @@ def compute_adaptive_loss(cluster_projections, cluster_kernels, cluster_biases, 
                             cluster_inputs)
 
     # compute loss
-    batch_size = tf.shape(a_prev)[0]
+
+    # cluster_inputs and cluster_labels will no longer have a time dimension at
+    # this point, meaning the head cluster will have batch_size*sequence_length
+    # for it's first dimension. We will need this value later to average the
+    # cost.
+    batch_size_seq_length_product = tf.shape(cluster_inputs[0])[0]
     has_steps = len(K.int_shape(logits[0])) > 2
 
     total_cost = None
@@ -140,7 +145,7 @@ def compute_adaptive_loss(cluster_projections, cluster_kernels, cluster_biases, 
         else:
             total_cost = tf.add(total_cost, cost)
 
-    cost_mean = tf.divide(total_cost, tf.cast(batch_size, 'float32'))
+    cost_mean = tf.divide(total_cost, tf.cast(batch_size_seq_length_product, 'float32'))
     return cost_mean
 
 def compute_softmax(clusters, cutoffs):
