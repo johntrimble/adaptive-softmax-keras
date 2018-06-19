@@ -1,6 +1,8 @@
 import tensorflow as tf
 from keras import backend as K
 from keras.layers import Layer
+from keras import initializers
+from keras import regularizers
 
 def build_default_capacities(max_capacity, cutoffs, min_capacity=2):
     return [max(min_capacity, max_capacity >> (2*i)) for i in range(len(cutoffs))]
@@ -110,7 +112,8 @@ def compute_logits(cluster_projections, cluster_kernels, cluster_biases, cluster
         if projection:
             x = K.dot(cluster_input, projection)
         x = K.dot(x, kernel)
-        x = K.bias_add(x, bias)
+        if not bias is None:
+            x = K.bias_add(x, bias)
 #             x = tf.Print(x, [tf.shape(x)])
         outputs.append(x)
     return outputs
@@ -248,18 +251,26 @@ class AdaptiveSoftmaxProduceLogits(Layer):
                  number_categories,
                  cutoffs,
                  capacities=None,
+                 use_bias=True,
                  kernel_initializer='glorot_uniform',
                  projection_initializer='glorot_uniform',
                  bias_initializer='zeros',
+                 kernel_regularizer=None,
+                 projection_regularizer=None,
+                 bias_regularizer=None,
                  **kwargs):
         super(AdaptiveSoftmaxProduceLogits, self).__init__(**kwargs)
-        self.kernel_initializer = kernel_initializer
-        self.projection_initializer = projection_initializer
-        self.bias_initializer = bias_initializer
+        self.kernel_initializer = initializers.get(kernel_initializer)
+        self.projection_initializer = initializers.get(projection_initializer)
+        self.bias_initializer = initializers.get(bias_initializer)
+        self.kernel_regularizer = regularizers.get(kernel_regularizer)
+        self.projection_regularizer = regularizers.get(projection_regularizer)
+        self.bias_regularizer = regularizers.get(bias_regularizer)
         self.cutoffs = list(cutoffs)
         if self.cutoffs[-1] < number_categories:
             self.cutoffs.append(number_categories)
         self.capacities = capacities
+        self.use_bias = use_bias
 
     def build(self, input_shapes):
         if isinstance(input_shapes, list):
@@ -281,12 +292,17 @@ class AdaptiveSoftmaxProduceLogits(Layer):
             cluster_kernel = self.add_weight(name='cluster_kernel_%s' % i,
                                              shape=cluster_kernel_shape,
                                              initializer=self.kernel_initializer,
+                                             regularizer=self.kernel_regularizer,
                                              trainable=True)
 
-            cluster_bias = self.add_weight(name='cluster_bias_%s' % i,
-                                           shape=(cluster_kernel_shape[1],),
-                                           initializer=self.bias_initializer,
-                                           trainable=True)
+            if self.use_bias:
+                cluster_bias = self.add_weight(name='cluster_bias_%s' % i,
+                                               shape=(cluster_kernel_shape[1],),
+                                               initializer=self.bias_initializer,
+                                               regularizer=self.bias_regularizer,
+                                               trainable=True)
+            else:
+                cluster_bias = None
 
             cluster_projection_shape = cluster_projection_shapes[i]
             if cluster_projection_shape is None:
@@ -295,6 +311,7 @@ class AdaptiveSoftmaxProduceLogits(Layer):
                 cluster_projection = self.add_weight(name='cluster_projection_%s' % i,
                                                      shape=cluster_projection_shape,
                                                      initializer=self.projection_initializer,
+                                                     regularizer=self.projection_regularizer,
                                                      trainable=True)
 
             self.cluster_kernels.append(cluster_kernel)
