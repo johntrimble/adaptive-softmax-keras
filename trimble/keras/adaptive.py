@@ -151,12 +151,25 @@ def compute_adaptive_loss(cluster_projections, cluster_kernels, cluster_biases, 
     cost_mean = tf.divide(total_cost, tf.cast(batch_size_seq_length_product, 'float32'))
     return cost_mean
 
-def compute_softmax(clusters, cutoffs):
-    cluster_softmaxes = [K.softmax(cluster_logits) for cluster_logits in clusters]
+def compute_prob(clusters, cutoffs):
+    # get prob for each cluster
+    cluster_probs = [K.softmax(cluster_logits) for cluster_logits in clusters]
 
-    head_cluster_softmax = cluster_softmaxes[0]
+    # adjust prob for child clusters to account for probability
+    # of picking child
+    head_cluster_prob = cluster_probs[0]
     for i in range(len(cutoffs) - 1):
         child_idx = cutoffs[0]
+        # the probability of choosing the ith child
+        child_prob = head_cluster_prob[..., child_idx]
+        child_prob = tf.expand_dims(child_prob, axis=-1)
+        # multiply probability of choosing child to every
+        # item in child cluster
+        cluster_probs[i+1] = tf.multiply(cluster_probs[i+1], child_prob)
+
+    # combine everything into flattened prob
+    head_categories_prob = head_cluster_prob[..., 0:(cutoffs[0])]
+    return tf.concat([head_categories_prob] + cluster_probs[1:], axis=-1)
 
 def compute_logprob(clusters, cutoffs):
     # get log prob for each cluster
@@ -177,6 +190,7 @@ def compute_logprob(clusters, cutoffs):
     # combine everything into flattened log prob
     head_categories_logprob = head_cluster_logprob[..., 0:(cutoffs[0])]
     return tf.concat([head_categories_logprob] + cluster_logprobs[1:], axis=-1)
+
 
 class DifferentiatedSoftmaxProduceLogits(Layer):
     def __init__(self,
@@ -381,6 +395,27 @@ class AdaptiveSoftmaxProduceLogits(Layer):
             output_shapes.append((m, *(a_shape[1:-1]), output_dim))
 
         return output_shapes
+
+class AdaptiveProb(Layer):
+    def __iniit__(self, **kwargs):
+        super(AdaptiveProb, self).__init__(**kwargs)
+
+    def build(self, input_shapes):
+        cutoffs = []
+        number_clusters = len(input_shapes)
+        number_children = number_clusters - 1
+        cutoffs = [shape[-1] for shape in input_shapes]
+        cutoffs[0] = cutoffs[0] - number_children
+        self.cutoffs = cutoffs
+        super(AdaptiveProb, self).build(input_shapes)
+
+    def call(self, inputs, mask=None):
+        return compute_prob(inputs, self.cutoffs)
+
+    def compute_mask(self, inputs, mask=None):
+        if mask:
+            return mask[0]
+        return mask
 
 class AdaptiveLogProb(Layer):
     def __iniit__(self, **kwargs):

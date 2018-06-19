@@ -198,3 +198,18 @@ def test_AdaptiveLogProb():
     outputs = retrieve_adaptive_softmax_output([np.random.random((2, 5, 1000)).astype('float32')])
     prob_sum = np.sum(np.exp(outputs), axis=-1)
     assert np.all((prob_sum > 0.99999) & (prob_sum < 1.00001))
+
+def test_AdaptiveProb():
+    vocab_size=10000
+    cutoffs = [5000, 7000, 10000]
+
+    data_input = Input(shape=(None,1000), dtype='float32')
+
+    x = adaptive.AdaptiveSoftmaxProduceLogits(vocab_size, cutoffs=cutoffs)(data_input)
+    x = adaptive.AdaptiveProb()(x)
+
+    retrieve_adaptive_softmax_output = K.function([data_input], [x])
+
+    outputs = retrieve_adaptive_softmax_output([np.random.random((2, 5, 1000)).astype('float32')])
+    prob_sum = np.sum(outputs, axis=-1)
+    assert np.all((prob_sum > 0.999) & (prob_sum < 1.001))
