@@ -1,3 +1,6 @@
 **/__pycache__
 benchmark_out
 .cache
+adaptive_softmax_keras.egg-info
+dist
+build
