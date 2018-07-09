@@ -4,3 +4,4 @@ benchmark_out
 adaptive_softmax_keras.egg-info
 dist
 build
+.pytest_cache

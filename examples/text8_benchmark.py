@@ -32,13 +32,14 @@ long time to train on the CPU (over a day) so use of a GPU is recommended.
 from keras.utils.data_utils import get_file
 from keras.preprocessing import text
 from keras.preprocessing import sequence
-
+from keras import initializers
 from keras.models import Model
 from keras.layers import (Dense,
                           Dropout,
                           Input,
                           LSTM,
-                          Embedding)
+                          Embedding,
+                          Activation)
 from keras.optimizers import Adagrad
 from trimble.keras.adaptive import (DifferentiatedSoftmaxProduceLogits,
                                     AdaptiveSoftmaxProduceLogits,
@@ -56,88 +57,51 @@ import json
 
 TEXT8_DATA_URL='http://mattmahoney.net/dc/text8.zip'
 
-def segment_sequence_into_batches(data, batch_size=128, sequence_length=20):
-    """
-    For performance reasons, it is often desirable to train a language model on
-    batches of multiple sequences of text at a time as opposed to on one
-    continuous sequence of text. This function takes a continuous sequence of
-    data and reshapes such that when passed to a function like `Model.fit`, the
-    samples of batch `n` will be a continuation of the samples of batch `n-1`,
-    and the samples of batch `n-1` will be a continuation of the samples of
-    batch `n-2`, etc. This will permit RNN state to be carried over productively
-    from batch to batch.
-
-    Consider a sequence like the following:
-
-        >>> data = list(range(1,14))
-        >>> data
-        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
-
-    calling this function on the data provides the following:
-
-        >>> X = segment_sequence_into_batches(data, batch_size=3, sequence_length=4)
-        >>> X
-        array([[ 1,  2,  3,  4],
-               [ 6,  7,  8,  9],
-               [11, 12, 13,  0],
-               [ 5,  0,  0,  0],
-               [10,  0,  0,  0],
-               [ 0,  0,  0,  0]], dtype=int32)
-
-    if we look at the first batch:
-
-        >>> X[0:3]
-        array([[ 1,  2,  3,  4],
-               [ 6,  7,  8,  9],
-               [11, 12, 13,  0]], dtype=int32)
-
-    and the second batch:
-
-        >>> X[3:6]
-        array([[ 5,  0,  0,  0],
-               [10,  0,  0,  0],
-               [ 0,  0,  0,  0]], dtype=int32)
-
-    we can see that the samples from the second batch are a continuation of
-    those from the first.
-    """
-    segment_length = math.ceil(len(data) / batch_size)
-    total_batches = math.ceil(segment_length / sequence_length)
-    x = []
-    for batch_idx in range(total_batches):
-        for segment_idx in range(batch_size):
-            segment_start = segment_idx*segment_length
-            segment_end = (segment_idx+1)*segment_length
-            batch_start = batch_idx*sequence_length
-            batch_end = (batch_idx+1)*sequence_length
-            sample_start = min(segment_start+batch_start, segment_end)
-            sample_end = min(segment_start+batch_end, segment_end)
-            sample = data[sample_start:sample_end]
-            x.append(sample)
-    return sequence.pad_sequences(x, padding='post', maxlen=sequence_length)
-
-def _build_tokenizer(data, vocab_size=45000):
-    tokenizer = text.Tokenizer()
-    tokenizer.fit_on_texts([data])
-    word_index = {w: i for (w,i) in tokenizer.word_index.items() if i < vocab_size - 1}
-    tokenizer = text.Tokenizer(num_words=vocab_size, oov_token=vocab_size-1)
-    tokenizer.word_index = word_index
-    return tokenizer
-
-def _load_raw_text8_data():
+def _load_raw_text8_data(output_directory='./benchmark_out'):
     dirname = 'text8.zip'
     path = get_file(
         dirname,
         origin=TEXT8_DATA_URL,
         md5_hash='f26f94c5209bc6159618bad4a559ff81',
-        archive_format='zip')
+        archive_format='zip',
+        cache_dir=output_directory)
 
     with ZipFile(path) as text8zip:
         with io.TextIOWrapper(text8zip.open('text8'), encoding='utf-8') as text8file:
             return text8file.read()
 
-def load_data(vocab_size=45000, batch_size=128, sequence_length=20):
-    """Loads Text8 dataset. (http://mattmahoney.net/dc/textdata.html)
+def _build_tokenizer(data, vocab_size=45000):
+    num_words = vocab_size-1
+    tokenizer = text.Tokenizer()
+    tokenizer.fit_on_texts([data])
+    words = ['</s>', '<unk>']
+    words.extend([w for (w,_) in sorted(list(tokenizer.word_index.items()), key=lambda x: x[1])])
+    words = words[:num_words]
+    word_index = dict(zip(words, range(1, vocab_size)))
+    tokenizer = text.Tokenizer(num_words=min(num_words, len(word_index)), oov_token='<unk>')
+    tokenizer.word_index = word_index
+    return tokenizer
+
+def _split_text8(text8_text):
+    return text8_text[:99000000], text8_text[99000000:]
+
+def _segment_sequence_into_batches(data_sequence, eos_idx, batch_size, sequence_length):
+    number_batches = int(np.ceil(len(data_sequence) / (batch_size*sequence_length)))
+    data = np.full(number_batches*sequence_length*batch_size, eos_idx, dtype='int32')
+    data[-len(data_sequence):] = data_sequence
+    data = np.reshape(data, (batch_size, -1))
+
+    x = np.roll(data, 1, axis=1)
+    x[:, 0] = eos_idx
+    x = np.vstack(np.hsplit(x, x.shape[1] // 20))
+
+    labels = np.vstack(np.hsplit(data, data.shape[1] // 20))
+    labels = np.expand_dims(labels, axis=-1)
+    return x, labels
+
+def load_data(vocab_size=45000, batch_size=128, sequence_length=20, output_directory='./benchmark_out'):
+    """
+    Loads Text8 dataset. (http://mattmahoney.net/dc/textdata.html)
 
     # Arguments
         vocab_size: maximum number of words to use.
@@ -148,36 +112,28 @@ def load_data(vocab_size=45000, batch_size=128, sequence_length=20):
     # Returns
         Tuple of Numpy arrays: `(x_train, y_train), (x_test, y_test)`.
     """
-    raw_data = _load_raw_text8_data()
-
-    tokenizer = _build_tokenizer(raw_data, vocab_size=vocab_size)
-
-    train_text = raw_data[:99000000]
-    dev_text = raw_data[99000000:]
-
+    raw_data = _load_raw_text8_data(output_directory=output_directory)
+    train_text, dev_text = _split_text8(raw_data)
+    tokenizer = _build_tokenizer(train_text, vocab_size=vocab_size)
     raw_data = None # allow gc
+    eos_idx = tokenizer.word_index['</s>']
 
-    result = []
-    for data_text in [train_text, dev_text]:
-        data_sequence = tokenizer.texts_to_sequences([data_text])[0]
-        data_input = segment_sequence_into_batches(
-            data_sequence,
-            batch_size=batch_size,
-            sequence_length=sequence_length)
-        data_labels = segment_sequence_into_batches(
-            data_sequence[1:] + [0],
-            batch_size=batch_size,
-            sequence_length=sequence_length)
-        result.append((data_input, data_labels))
+    results = []
+    data_sequence = tokenizer.texts_to_sequences([train_text])[0] + [eos_idx]
+    results.append(_segment_sequence_into_batches(data_sequence, eos_idx, batch_size, sequence_length))
+    data_sequence = tokenizer.texts_to_sequences([dev_text])[0] + [eos_idx]
+    results.append(_segment_sequence_into_batches(data_sequence, eos_idx, batch_size, sequence_length))
 
-    return tuple(result)
+    return tuple(results)
 
-def get_word_index(vocab_size=45000):
-    raw_data = _load_raw_text8_data()
-    tokenizer = _build_tokenizer(raw_data, vocab_size=vocab_size)
+def get_word_index(vocab_size=45000, output_directory="./benchmark_out"):
+    raw_data = _load_raw_text8_data(output_directory=output_directory)
+    train_text, _ = _split_text8(raw_data)
+    tokenizer = _build_tokenizer(train_text, vocab_size=vocab_size)
     return tokenizer.word_index
 
 def sparse_cross_entropy(y_true, y_pred):
+    y_true = tf.cast(tf.squeeze(y_true, axis=-1), tf.int32)
     loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=y_true,
                                                           logits=y_pred)
     return loss
@@ -191,9 +147,9 @@ def _build_base_model(
         dropout=0.0):
 
     inputs = Input(name='data_input', batch_shape=(batch_size, sequence_length), dtype='int32')
-    embedding = Embedding(input_dim=vocab_size, output_dim=input_word_vectors_dim, mask_zero=True)
+    embedding = Embedding(input_dim=vocab_size, output_dim=input_word_vectors_dim, mask_zero=False)
     dropout_pre_rnn = Dropout(dropout)
-    rnn = LSTM(hidden_dim, return_sequences=True, stateful=True)
+    rnn = LSTM(hidden_dim, return_sequences=True, stateful=True, unroll=True)
     dropout_post_rnn = Dropout(dropout)
 
     x = inputs
@@ -204,85 +160,36 @@ def _build_base_model(
 
     return (inputs, x)
 
-def build_adaptive_softmax_model(
-        cutoffs,
-        batch_size=128,
-        sequence_length=20,
-        vocab_size=45000,
-        input_word_vectors_dim=256,
-        hidden_dim=2048,
-        dropout=0.0,
-        lr=0.1,
-        clipnorm=1):
-    labels = Input(name='labels_input', batch_shape=(batch_size, sequence_length), dtype='int32')
+def build_adaptive_softmax_model(cutoffs, lr=0.1, batch_size=128, sequence_length=20, vocab_size=45000, **kwargs):
+    labels = Input(name='labels_input', batch_shape=(batch_size, sequence_length, 1), dtype='int32')
 
-    (inputs, x) = _build_base_model(batch_size=batch_size,
-                                    sequence_length=sequence_length,
-                                    vocab_size=vocab_size,
-                                    input_word_vectors_dim=input_word_vectors_dim,
-                                    hidden_dim=hidden_dim,
-                                    dropout=dropout)
+    (inputs, x) = _build_base_model(batch_size=batch_size, sequence_length=sequence_length, vocab_size=vocab_size, **kwargs)
     adaptive_softmax_layer = AdaptiveSoftmaxProduceLogits(vocab_size, cutoffs=cutoffs)
     x = adaptive_softmax_layer([x, labels])
 
     model = Model(inputs=[inputs, labels], outputs=x)
-    optimizer = Adagrad(lr=lr, clipnorm=clipnorm)
+    optimizer = Adagrad(lr=lr)
     model.compile(optimizer=optimizer)
 
     return model
 
-def build_full_softmax_model(
-        batch_size=128,
-        sequence_length=20,
-        vocab_size=45000,
-        input_word_vectors_dim=256,
-        hidden_dim=2048,
-        dropout=0.0,
-        lr=0.1,
-        clipnorm=1):
+def build_full_softmax_model(lr=0.1, vocab_size=45000, **kwargs):
+    (inputs, x) = _build_base_model(**kwargs)
+    x = Dense(vocab_size, activation='linear')(x)
 
-    (inputs, x) = _build_base_model(batch_size=batch_size,
-                                    sequence_length=sequence_length,
-                                    vocab_size=vocab_size,
-                                    input_word_vectors_dim=input_word_vectors_dim,
-                                    hidden_dim=hidden_dim,
-                                    dropout=dropout)
-
-    x = Dense(vocab_size)(x)
     model = Model(inputs=inputs, outputs=x)
-    optimizer = Adagrad(lr=lr, clipnorm=clipnorm)
-    # This bit of hoodoo is thanks to https://github.com/tensorflow/tensorflow/issues/17150. It works around
-    # a bug where Keras cannot figure out the proper output shape.
-    dummy_target = tf.placeholder(dtype='int32', shape=(None, None))
-    model.compile(optimizer=optimizer, loss=sparse_cross_entropy, target_tensors=[dummy_target])
+    optimizer = Adagrad(lr=lr)
+    model.compile(optimizer=optimizer, loss=sparse_cross_entropy)
 
     return model
 
-def build_differentiated_softmax_model(
-        cutoffs,
-        batch_size=128,
-        sequence_length=20,
-        vocab_size=45000,
-        input_word_vectors_dim=256,
-        hidden_dim=2048,
-        dropout=0.0,
-        lr=0.1,
-        clipnorm=1):
-
-    (inputs, x) = _build_base_model(batch_size=batch_size,
-                                    sequence_length=sequence_length,
-                                    vocab_size=vocab_size,
-                                    input_word_vectors_dim=input_word_vectors_dim,
-                                    hidden_dim=hidden_dim,
-                                    dropout=dropout)
-
+def build_differentiated_softmax_model(cutoffs, lr=0.1, vocab_size=45000, **kwargs):
+    (inputs, x) = _build_base_model(vocab_size=vocab_size, **kwargs)
     x = DifferentiatedSoftmaxProduceLogits(vocab_size, cutoffs)(x)
+
     model = Model(inputs=inputs, outputs=x)
-    optimizer = Adagrad(lr=lr, clipnorm=clipnorm)
-    # This bit of hoodoo is thanks to https://github.com/tensorflow/tensorflow/issues/17150. It works around
-    # a bug where Keras cannot figure out the proper output shape.
-    dummy_target = tf.placeholder(dtype='int32', shape=(None, None))
-    model.compile(optimizer=optimizer, loss=sparse_cross_entropy, target_tensors=[dummy_target])
+    optimizer = Adagrad(lr=lr)
+    model.compile(optimizer=optimizer, loss=sparse_cross_entropy)
 
     return model
 
@@ -374,7 +281,7 @@ def dump_graph(results, destination_path):
         color = colors[i % len(colors)]
         shape = shapes[i % len(shapes)]
         plt.plot(times[1:], ppls[1:], "%s-" % color, label=label)
-        plt.plot(times[1:], ppls[1:], "%s%s" % (color, shape), label=label)
+        plt.plot(times[1:], ppls[1:], "%s%s" % (color, shape))
     plt.ylim([80, 600])
     plt.ylabel('Perplexity')
     plt.xlim(xmin=0)
@@ -383,9 +290,9 @@ def dump_graph(results, destination_path):
     plt.savefig(destination_path)
 
 def run_benchmarks(epochs, benchmarks=None, output_directory='benchmark_out', resume=False):
-    (x_train, y_train), (x_valid, y_valid) = load_data()
+    (x_train, y_train), (x_valid, y_valid) = load_data(output_directory=output_directory)
 
-    model_options = {'lr': 0.1, 'dropout': 0.25, 'hidden_dim': 512, 'input_word_vectors_dim': 512, 'clipnorm': 1}
+    model_options = {'lr': 0.1, 'dropout': 0.25, 'hidden_dim': 512, 'input_word_vectors_dim': 512}
 
     def full_softmax_benchmark():
         model = build_full_softmax_model(**model_options)
@@ -441,6 +348,11 @@ if __name__ == '__main__':
                         action='append',
                         help="run benchmark for different variations of softmax")
 
+    parser.add_argument('--iterations',
+                        type=int,
+                        default=10,
+                        help="number of training iterations")
+
     parser.add_argument('--no-resume',
                         dest='resume',
                         action='store_false',
@@ -461,7 +373,7 @@ if __name__ == '__main__':
     if not os.path.exists(options.output_directory):
         os.mkdir(options.output_directory)
 
-    result = run_benchmarks(10, benchmarks=options.benchmarks, output_directory=options.output_directory, resume=options.resume)
+    result = run_benchmarks(options.iterations, benchmarks=options.benchmarks, output_directory=options.output_directory, resume=options.resume)
     print_summary(result)
     if options.graph:
         dump_graph(result, os.path.join(options.output_directory, 'text8_performance_comparison.png'))

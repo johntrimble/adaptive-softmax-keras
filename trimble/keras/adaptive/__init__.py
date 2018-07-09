@@ -54,8 +54,6 @@ def compute_cluster_labels(labels, child_cluster_masks, cutoffs, mask=None):
         # labels for this cluster
         child_labels = tf.boolean_mask(labels, child_cluster_mask)
         child_labels = tf.subtract(child_labels, cutoffs[i])
-        child_labels = tf.expand_dims(child_labels, 1)
-    #                 labels_child = tf.Print(labels_child, [labels_child], message="labels %s: " % (i+1), summarize=10)
         cluster_labels.append(child_labels)
 
         # update head labels indicating which child cluster the category resides in
@@ -69,22 +67,16 @@ def compute_cluster_labels(labels, child_cluster_masks, cutoffs, mask=None):
     # Due to application of masks to our inputs, we will naturally lose the
     # steps dimension for the inputs of our tail clusters. We remove this
     # dimension from the head input as well for consistency.
-    head_labels = K.reshape(head_labels, K.constant([-1, 1], dtype='int32'))
+    head_labels = K.reshape(head_labels, K.constant([-1], dtype='int32'))
 
     cluster_labels.insert(0, head_labels)
     return cluster_labels
 
 def compute_cluster_inputs(inputs, child_cluster_masks, cutoffs, mask=None):
     # input for this cluster
-    has_steps = len(K.int_shape(inputs)) > 2
-
     child_inputs = []
     for i in range(len(child_cluster_masks)):
         child_cluster_mask = child_cluster_masks[i]
-
-        if not has_steps:
-            child_cluster_mask = tf.squeeze(child_cluster_mask, axis=[-1])
-
         x = tf.boolean_mask(inputs, child_cluster_mask)
         child_inputs.append(x)
 
@@ -102,6 +94,23 @@ def compute_cluster_inputs(inputs, child_cluster_masks, cutoffs, mask=None):
     return [inputs] + child_inputs
 
 def compute_logits(cluster_projections, cluster_kernels, cluster_biases, cluster_inputs):
+    """
+    # Arguments
+        cluster_projections: List of k projection tensors, one for each cluster,
+            with shape `(cluster_inputs[k].shape[-1], cluster_kernsl[k].shape[0])`.
+            If `cluster_inputs[k].shape[-1] == cluster_kernsl[k].shape[0]` for
+            a given cluster, then cluster_projections[k] may be None.
+        cluster_kernels: List of k tensors, one for each cluster.
+        cluster_biases: List of k tensors, one for each cluster, with shape
+            `(cluster_kernels[k].shape[-1],)`
+        cluster_inputs: List of k tensors, one for each cluster, with shape
+            `(samples, ..., features)`. Typically, this is just the output from
+            the previous layer repeated for each cluster.
+
+    # Returns
+        k tensors, one for each cluster, with shape
+            `(samples, ..., cluster_kernels[k].shape[-1])`.
+    """
     outputs = []
     for i in range(len(cluster_inputs)):
         projection = cluster_projections[i]
@@ -114,7 +123,6 @@ def compute_logits(cluster_projections, cluster_kernels, cluster_biases, cluster
         x = K.dot(x, kernel)
         if not bias is None:
             x = K.bias_add(x, bias)
-#             x = tf.Print(x, [tf.shape(x)])
         outputs.append(x)
     return outputs
 
@@ -135,12 +143,9 @@ def compute_adaptive_loss(cluster_projections, cluster_kernels, cluster_biases, 
     # for it's first dimension. We will need this value later to average the
     # cost.
     batch_size_seq_length_product = tf.shape(cluster_inputs[0])[0]
-    has_steps = len(K.int_shape(logits[0])) > 2
 
     total_cost = None
     for logits, labels in zip(logits, cluster_labels):
-        if not has_steps:
-            labels = tf.squeeze(labels, axis=1)
         cost = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=logits)
         cost = tf.reduce_sum(cost)
         if total_cost is None:
@@ -258,9 +263,53 @@ class DifferentiatedSoftmaxProduceLogits(Layer):
         return mask
 
     def compute_output_shape(self, input_shapes):
-        return (input_shapes[0], self.number_categories)
+        return (*input_shapes[:-1], self.number_categories)
 
 class AdaptiveSoftmaxProduceLogits(Layer):
+    """
+    # Arguments
+        number_categories: Positive integer, dimensionality of the output space
+        cutoffs: List of integers, the cutoff for each cluster (eg. if
+            `number_categories` is 100 and cuttoffs is `[10, 30]` then 3
+            clusters will be created, a head cluster for the first 10 categories
+            the second cluster for the next 20 categories, and a third cluster
+            for the final 70 categories).
+        capacities: List of integers, representing the size of the output
+            embeddings for each cluster.
+        use_bias: Boolean, whether to use a bias.
+        kernel_initializer: Initializer for cluster matrices.
+        projection_initializer: Initializer for child cluster projections.
+        bias_initializer: Initializer for bias.
+        kernel_regularizer: Regularizer for cluster matrices.
+        projection_regularizer: Regularizer for child cluster projections.
+        bias_regularizer: Regularizer for bias.
+
+    # Input shape
+        Option 1:
+            nD input tensor with shape `(samples, ..., features)`
+            nD label tensor with shape `(samples, ..., 1)`
+        Option 2:
+            nD input tensor with shape `(samples, ..., features)`
+
+        (1) is used for training and will cause an appropriate cross-entropy
+        loss to be added to the model. The labels must be provided as an input
+        to determine the appropriate dot products to compute.
+        (2) is useful when doing inference as it does not require the labels be
+        provided as input and will also not cause a loss to be added to the
+        model.
+
+    # Output shape
+        List of nD tensors representing the logits for each cluster. For
+            example, if cutoffs is set to `[5000, 7000]` and `number_categories`
+            is set to 10000, then the output shapes will be:
+
+                `(samples, ..., 5002)`
+                `(samples, ..., 2000)`
+                `(samples, ..., 3000)`
+
+            These logits can be appropriately normalized and merged using either
+            a `AdaptiveProb` or `AdaptiveLogProb` layer.
+    """
     def __init__(self,
                  number_categories,
                  cutoffs,
@@ -358,6 +407,7 @@ class AdaptiveSoftmaxProduceLogits(Layer):
 
         if labels is not None:
             a_masking = mask[0] if mask else None
+            labels = tf.squeeze(labels, axis=-1)
             self.add_loss(self.compute_loss(a, labels, mask=a_masking), inputs)
 
         cluster_inputs = [a] * len(self.cutoffs)

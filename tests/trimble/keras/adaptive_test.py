@@ -1,7 +1,9 @@
 import numpy as np
 import tensorflow as tf
 import keras.backend as K
-from keras.layers import Input, Lambda
+from keras.models import Model
+from keras.layers import Input, Lambda, Embedding
+from keras import initializers
 from trimble.keras import adaptive
 
 def test_build_cluster_weight_shapes():
@@ -24,6 +26,7 @@ def test_compute_child_cluster_masks():
                        [5159,  681, 8546, 2018, 5645],
                        [ 506, 3150, 6184, 6312, 2690],
                        [ 448,  982, 5918, 1128, 3960]], dtype='int32')
+    labels = np.expand_dims(labels, axis=-1)
 
     with tf.Session() as session:
         inputs = tf.constant(labels)
@@ -109,7 +112,7 @@ def test_AdaptiveSoftmaxProduceLogits_3d_inputs():
     cutoffs = [5000, 7000, 10000]
 
     data_input = Input(shape=(None,1000), dtype='float32')
-    labels_input = Input(shape=(None,), dtype='int32')
+    labels_input = Input(shape=(None,1), dtype='int32')
     adaptive_softmax = adaptive.AdaptiveSoftmaxProduceLogits(vocab_size, cutoffs=cutoffs)
     adaptive_softmax_out = adaptive_softmax([data_input, labels_input])
 
@@ -128,9 +131,8 @@ def test_AdaptiveSoftmaxProduceLogits_3d_inputs():
                        [5159,  681, 8546, 2018, 5645],
                        [ 506, 3150, 6184, 6312, 2690],
                        [ 448,  982, 5918, 1128, 3960]], dtype='int32')
+    labels = np.expand_dims(labels, axis=-1)
     outputs = retrieve_adaptive_softmax_output([X, labels])
-
-    print([x.shape for x in outputs])
 
     # verify the output shapes
     assert len(outputs) == len(cutoffs)
@@ -142,8 +144,8 @@ def test_AdaptiveSoftmaxProduceLogits_masking():
     vocab_size=10000
     cutoffs = [5000, 7000, 10000]
 
-    data_input = Input(shape=(None,1000), dtype='float32')
-    labels_input = Input(shape=(None,), dtype='int32')
+    data_input = Input(shape=(5,1000), dtype='float32')
+    labels_input = Input(shape=(5,1), dtype='int32')
     mask = tf.constant([[True,  True,  True,  True,  False],
                         [True,  True,  False, False, False],
                         [True,  True,  True,  True,  False],
@@ -154,7 +156,6 @@ def test_AdaptiveSoftmaxProduceLogits_masking():
                         [True,  True,  True,  True,   True],
                         [True,  False, False, False, False],
                         [True,  True,  True,  True,  False]])
-    mask = tf.Print(mask, [tf.shape(mask)], message="Mask mask shape: ")
     add_mask = Lambda(lambda x: x, mask=[mask, mask])
     inputs_masked = add_mask([data_input, labels_input])
 
@@ -176,6 +177,7 @@ def test_AdaptiveSoftmaxProduceLogits_masking():
                        [5159,  681, 8546, 2018, 5645],
                        [ 506, 3150, 6184, 6312, 2690],
                        [ 448,  982, 5918, 1128, 3960]], dtype='int32')
+    labels = np.expand_dims(labels, axis=-1)
     outputs = retrieve_adaptive_softmax_output([X, labels])
 
     # verify the output shapes
@@ -183,6 +185,53 @@ def test_AdaptiveSoftmaxProduceLogits_masking():
     assert (10, 5, 5002) == outputs[0].shape
     assert (10, 5, 2000) == outputs[1].shape
     assert (10, 5, 3000) == outputs[2].shape
+
+def test_AdaptiveSoftmaxProduceLogits_masking_cost():
+    data_input = Input(shape=(20,), dtype='int32')
+    labels_input = Input(shape=(20,1), dtype='int32')
+
+    embedding_layer = Embedding(
+        11,
+        6,
+        mask_zero=True,
+        embeddings_initializer=initializers.Constant(value=0.1))
+
+    # By setting the weight values to a 0.1, we ensure that labels in a child
+    # cluster will always have lower probability that those in the head. We
+    # exploit this fact to check if masking is handled correctly.
+    logits_layer = adaptive.AdaptiveSoftmaxProduceLogits(
+        10,
+        cutoffs=[5],
+        kernel_initializer=initializers.Constant(value=0.1),
+        projection_initializer=initializers.Constant(value=0.1))
+
+    x = embedding_layer(data_input)
+    x = logits_layer([x, labels_input])
+
+    model = Model(inputs=[data_input, labels_input], outputs=x)
+    model.compile(optimizer='adam')
+
+    # Create random dataset where each sample has a different length with 0 padding
+    # and none of the labels use category 1
+    x_data = np.zeros((32, 20))
+    y_data = np.zeros((32, 20, 1))
+    for i in range(32):
+        length = np.random.randint(1, 20)
+        x_data[i, 0:length] = np.random.randint(2, 5, size=length)
+        y_data[i, 0:length] = np.random.randint(2, 5, size=(length, 1))
+
+    # Evaluate to get the cost
+    cost1 = model.evaluate([x_data, y_data])
+
+    # Change the 0s to 7s in the labels. If masking is handled correctly, this
+    # shouldn't matter as these labels will be ignored anyway. If masking is not
+    # handled correctly, then the cost should go up as the probability of 7
+    # being the correct category is lower than categories 1-5.
+    y_data[y_data == 0] = 7
+
+    cost2 = model.evaluate([x_data, y_data])
+
+    assert cost1 == cost2
 
 def test_AdaptiveLogProb():
     vocab_size=10000
