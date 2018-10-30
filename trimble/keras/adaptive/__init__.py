@@ -164,7 +164,7 @@ def compute_prob(clusters, cutoffs):
     # of picking child
     head_cluster_prob = cluster_probs[0]
     for i in range(len(cutoffs) - 1):
-        child_idx = cutoffs[0]
+        child_idx = cutoffs[0] + i
         # the probability of choosing the ith child
         child_prob = head_cluster_prob[..., child_idx]
         child_prob = tf.expand_dims(child_prob, axis=-1)

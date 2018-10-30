@@ -35,6 +35,32 @@ def test_compute_child_cluster_masks():
         assert [5586, 6291, 6227, 6129, 5079, 5110, 5159, 5645, 6184, 6312, 5918] == labels[cluster_masks[1]].tolist()
         assert [7741, 7520, 8577, 9086, 7241, 9889, 8587, 8016, 7380, 8546] == labels[cluster_masks[2]].tolist()
 
+def test_compute_prob():
+    # with timesteps
+    with tf.Session() as sess:
+        c1 = tf.constant(np.random.random((10, 5, 12)))
+        c2 = tf.constant(np.random.random((10, 5, 10)))
+        c3 = tf.constant(np.random.random((10, 5, 20)))
+        result = sess.run(adaptive.compute_prob([c1, c2, c3], [10, 20, 40]))
+        # did we get the right shape?
+        assert (10, 5, 40) == result.shape
+        # do we have a valid probability distribution?
+        prob_sum = np.sum(result, axis=-1)
+        assert np.all((prob_sum > 0.99999) & (prob_sum < 1.00001))
+
+    # without timesteps
+    with tf.Session() as sess:
+        c1 = tf.constant(np.random.random((10, 12)))
+        c2 = tf.constant(np.random.random((10, 10)))
+        c3 = tf.constant(np.random.random((10, 20)))
+        result = sess.run(adaptive.compute_prob([c1, c2, c3], [10, 20, 40]))
+        # did we get the right shape?
+        assert (10, 40) == result.shape
+        # do we have a valid probability distribution?
+        prob_sum = np.sum(result, axis=-1)
+        assert np.all((prob_sum > 0.99999) & (prob_sum < 1.00001))
+
+
 def test_compute_logprob():
     # with timesteps
     with tf.Session() as sess:
